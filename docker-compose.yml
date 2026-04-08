@@ -1,0 +1,28 @@
+services:
+  camera-health-monitor:
+    build: .
+    container_name: camera-health-monitor
+    restart: unless-stopped
+    environment:
+      - FRIGATE_URL=http://frigate:5000
+      - CAMERA_USER=${CAMERA_USER}
+      - CAMERA_PASSWORD=${CAMERA_PASSWORD}
+      - CHECK_INTERVAL=120
+      - HA_URL=${HA_URL:-}
+      - HA_TOKEN=${HA_TOKEN:-}
+      - REBOOT_THRESHOLD=3
+    # Must be able to reach Frigate API and camera IPs on 192.168.42.x
+    # Option A: same network as Frigate
+    # network_mode: "host"
+    # Option B: join Frigate's docker network (update network name to match)
+    networks:
+      - frigate_default
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  frigate_default:
+    external: true
