@@ -1,6 +1,6 @@
 services:
   camera-health-monitor:
-    build: .
+    image: ghcr.io/rgregg/camera-health-monitor:latest
     container_name: camera-health-monitor
     restart: unless-stopped
     environment:
