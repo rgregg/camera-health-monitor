@@ -29,6 +29,7 @@ REBOOT_THRESHOLD = int(os.environ.get("REBOOT_THRESHOLD", "3"))
 RTSP_PORT = 554
 RTSP_TIMEOUT = 3  # seconds
 REBOOT_COOLDOWN = 180  # seconds — skip reboot if last reboot was < 3 min ago
+MEMORY_THRESHOLD = float(os.environ.get("MEMORY_THRESHOLD", "90"))  # percent
 
 
 def fetch_camera_ips():
@@ -163,6 +164,72 @@ def send_ha_notification(ip, camera_names):
         log.warning("Failed to send HA notification: %s", e)
 
 
+def check_system_memory():
+    """Check Frigate system stats and alert if memory usage is too high."""
+    url = f"{FRIGATE_URL}/api/stats"
+    try:
+        with urlopen(url, timeout=10) as resp:
+            stats = json.loads(resp.read())
+    except (URLError, OSError, json.JSONDecodeError) as e:
+        log.warning("Failed to fetch Frigate stats: %s", e)
+        return
+
+    mem = stats.get("service", {}).get("memory", {})
+    used = mem.get("used", 0)
+    total = mem.get("total", 1)
+    pct = (used / total) * 100 if total > 0 else 0
+
+    if pct >= MEMORY_THRESHOLD:
+        if not _memory_alert_sent.get("active"):
+            log.warning("Memory usage critical: %.1f%% (%s / %s)",
+                        pct, _fmt_bytes(used), _fmt_bytes(total))
+            _send_system_alert(
+                title="Frigate Memory Alert",
+                message=(
+                    f"Frigate server memory usage is at {pct:.1f}% "
+                    f"({_fmt_bytes(used)} / {_fmt_bytes(total)}). "
+                    f"This may cause OOM issues and degraded performance."
+                ),
+            )
+            _memory_alert_sent["active"] = True
+    else:
+        if _memory_alert_sent.get("active"):
+            log.info("Memory usage recovered: %.1f%%", pct)
+            _memory_alert_sent["active"] = False
+        else:
+            log.debug("Memory usage: %.1f%%", pct)
+
+
+_memory_alert_sent = {"active": False}
+
+
+def _fmt_bytes(b):
+    """Format bytes as human-readable string."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(b) < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} TB"
+
+
+def _send_system_alert(title, message):
+    """Send a system-level alert to Home Assistant."""
+    if not HA_URL or not HA_TOKEN:
+        return
+
+    payload = json.dumps({"message": message, "title": title}).encode()
+    url = f"{HA_URL}/api/services/notify/notify"
+    req = Request(url, data=payload, method="POST")
+    req.add_header("Authorization", f"Bearer {HA_TOKEN}")
+    req.add_header("Content-Type", "application/json")
+
+    try:
+        with urlopen(req, timeout=10) as resp:
+            log.info("HA system alert sent: %s", title)
+    except (URLError, OSError) as e:
+        log.warning("Failed to send HA system alert: %s", e)
+
+
 def run_check_cycle(ip_to_cameras):
     """Run one health check cycle across all cameras."""
     healthy = 0
@@ -223,6 +290,7 @@ def main():
         "enabled" if HA_URL else "disabled",
         REBOOT_THRESHOLD,
     )
+    log.info("Memory alert threshold: %.0f%%", MEMORY_THRESHOLD)
 
     while True:
         ip_to_cameras = fetch_camera_ips()
@@ -230,6 +298,7 @@ def main():
             run_check_cycle(ip_to_cameras)
         else:
             log.warning("No cameras discovered — will retry next cycle")
+        check_system_memory()
         time.sleep(CHECK_INTERVAL)
 
 
