@@ -7,6 +7,7 @@ import os
 import re
 import socket
 import time
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
@@ -30,6 +31,10 @@ RTSP_PORT = 554
 RTSP_TIMEOUT = 3  # seconds
 REBOOT_COOLDOWN = 180  # seconds — skip reboot if last reboot was < 3 min ago
 MEMORY_THRESHOLD = float(os.environ.get("MEMORY_THRESHOLD", "90"))  # percent
+INFLUXDB_URL = os.environ.get("INFLUXDB_URL", "").rstrip("/")
+INFLUXDB_TOKEN = os.environ.get("INFLUXDB_TOKEN", "")
+INFLUXDB_ORG = os.environ.get("INFLUXDB_ORG", "smart_home")
+INFLUXDB_BUCKET = os.environ.get("INFLUXDB_BUCKET", "frigate-health")
 
 
 def fetch_camera_ips():
@@ -164,14 +169,103 @@ def send_ha_notification(ip, camera_names):
         log.warning("Failed to send HA notification: %s", e)
 
 
-def check_system_memory():
-    """Check Frigate system stats and alert if memory usage is too high."""
+def fetch_frigate_stats():
+    """Fetch Frigate stats once per cycle. Returns dict or None on failure."""
     url = f"{FRIGATE_URL}/api/stats"
     try:
         with urlopen(url, timeout=10) as resp:
-            stats = json.loads(resp.read())
+            return json.loads(resp.read())
     except (URLError, OSError, json.JSONDecodeError) as e:
         log.warning("Failed to fetch Frigate stats: %s", e)
+        return None
+
+
+def write_influxdb(lines):
+    """Write line protocol data to InfluxDB. lines is a list of strings."""
+    if not INFLUXDB_URL or not INFLUXDB_TOKEN:
+        return
+
+    url = (
+        f"{INFLUXDB_URL}/api/v2/write"
+        f"?org={quote(INFLUXDB_ORG)}&bucket={quote(INFLUXDB_BUCKET)}&precision=s"
+    )
+    body = "\n".join(lines).encode()
+    req = Request(url, data=body, method="POST")
+    req.add_header("Authorization", f"Token {INFLUXDB_TOKEN}")
+    req.add_header("Content-Type", "text/plain")
+
+    try:
+        with urlopen(req, timeout=10):
+            log.debug("Wrote %d points to InfluxDB", len(lines))
+    except (URLError, OSError) as e:
+        log.warning("Failed to write to InfluxDB: %s", e)
+
+
+def _escape_tag(value):
+    """Escape special characters in InfluxDB tag values."""
+    return str(value).replace(" ", "\\ ").replace(",", "\\,").replace("=", "\\=")
+
+
+def collect_and_write_metrics(stats, frozen=False):
+    """Collect metrics from Frigate stats and write to InfluxDB."""
+    if not INFLUXDB_URL or not INFLUXDB_TOKEN or stats is None:
+        return
+
+    now = int(time.time())
+    lines = []
+
+    # Detector metrics
+    for name, info in stats.get("detectors", {}).items():
+        inference = info.get("inference_speed", 0)
+        pid = info.get("pid", 0)
+        healthy = 1 if (inference < DETECTOR_INFERENCE_THRESHOLD and pid > 0) else 0
+        lines.append(
+            f"frigate_detector,detector={_escape_tag(name)} "
+            f"inference_speed={inference},pid={pid}i,healthy={healthy}i {now}"
+        )
+
+    # Camera metrics
+    for cam, info in stats.get("cameras", {}).items():
+        cam_fps = info.get("camera_fps", 0)
+        proc_fps = info.get("process_fps", 0)
+        det_fps = info.get("detection_fps", 0)
+        skipped_fps = info.get("skipped_fps", 0)
+        det_enabled = 1 if info.get("detection_enabled", False) else 0
+        lines.append(
+            f"frigate_camera,camera={_escape_tag(cam)} "
+            f"camera_fps={cam_fps},process_fps={proc_fps},"
+            f"detection_fps={det_fps},skipped_fps={skipped_fps},"
+            f"detection_enabled={det_enabled}i {now}"
+        )
+
+    # System metrics
+    service = stats.get("service", {})
+    mem = service.get("memory", {})
+    mem_used = mem.get("used", 0)
+    mem_total = mem.get("total", 1)
+    mem_pct = (mem_used / mem_total) * 100 if mem_total > 0 else 0
+    uptime = service.get("uptime", 0)
+
+    gpu = stats.get("gpu_usages", {})
+    gpu_util = 0
+    gpu_mem = 0
+    for _gpu_name, usage in gpu.items():
+        gpu_util = float(usage.get("gpu", "0").rstrip(" %") or 0)
+        gpu_mem = float(usage.get("mem", "0").rstrip(" %") or 0)
+        break  # first GPU
+
+    lines.append(
+        f"frigate_system memory_used={mem_used},memory_total={mem_total},"
+        f"memory_pct={mem_pct:.1f},uptime={uptime}i,"
+        f"gpu_util={gpu_util},gpu_mem={gpu_mem},stats_frozen={1 if frozen else 0}i {now}"
+    )
+
+    write_influxdb(lines)
+
+
+def check_system_memory(stats):
+    """Check Frigate system stats and alert if memory usage is too high."""
+    if stats is None:
         return
 
     mem = stats.get("service", {}).get("memory", {})
@@ -201,6 +295,15 @@ def check_system_memory():
 
 
 _memory_alert_sent = {"active": False}
+_detector_alert_sent = {"active": False}
+
+# Inference time above this (in ms) indicates a hung/failed detector
+DETECTOR_INFERENCE_THRESHOLD = float(os.environ.get("DETECTOR_INFERENCE_THRESHOLD", "1000"))
+
+# Consecutive cycles of byte-identical Frigate stats before flagging the stats engine frozen
+STATS_FROZEN_CYCLES = int(os.environ.get("STATS_FROZEN_CYCLES", "3"))
+_stats_frozen_alert_sent = {"active": False}
+_stats_signature = {"sig": None, "count": 0}
 
 
 def _fmt_bytes(b):
@@ -228,6 +331,101 @@ def _send_system_alert(title, message):
             log.info("HA system alert sent: %s", title)
     except (URLError, OSError) as e:
         log.warning("Failed to send HA system alert: %s", e)
+
+
+def check_detectors(stats):
+    """Check Frigate detector health and alert if any are failed/hung."""
+    if stats is None:
+        return
+
+    detectors = stats.get("detectors", {})
+    if not detectors:
+        log.warning("No detectors found in Frigate stats")
+        return
+
+    failed = []
+    for name, info in detectors.items():
+        inference = info.get("inference_speed", 0)
+        pid = info.get("pid", 0)
+        if inference > DETECTOR_INFERENCE_THRESHOLD or pid == 0:
+            failed.append(f"{name} (inference={inference:.0f}ms, pid={pid})")
+
+    if failed:
+        if not _detector_alert_sent.get("active"):
+            names = ", ".join(failed)
+            log.warning("Detector(s) unhealthy: %s", names)
+            _send_system_alert(
+                title="Frigate Detector Alert",
+                message=(
+                    f"Frigate detector(s) appear failed: {names}. "
+                    f"Object detection may be offline. "
+                    f"A Frigate restart is likely needed."
+                ),
+            )
+            _detector_alert_sent["active"] = True
+    else:
+        if _detector_alert_sent.get("active"):
+            log.info("All detectors recovered")
+            _detector_alert_sent["active"] = False
+        else:
+            log.debug("All %d detectors healthy", len(detectors))
+
+
+def _stats_fingerprint(stats):
+    """Signature of the volatile per-camera/detector metrics that SHOULD change every
+    cycle. Excludes uptime/memory (always advance) so an identical signature means
+    Frigate's stats are genuinely stuck, not just stable."""
+    parts = []
+    for cam in sorted(stats.get("cameras", {})):
+        info = stats["cameras"][cam]
+        parts.append(
+            f"{cam}:{info.get('camera_fps')}:{info.get('process_fps')}:"
+            f"{info.get('detection_fps')}:{info.get('skipped_fps')}"
+        )
+    for det in sorted(stats.get("detectors", {})):
+        parts.append(f"{det}:{stats['detectors'][det].get('inference_speed')}")
+    return "|".join(parts)
+
+
+def check_stats_frozen(stats):
+    """Detect a wedged Frigate stats engine: byte-identical camera/detector metrics
+    across STATS_FROZEN_CYCLES consecutive cycles (uptime keeps advancing, but the
+    real metrics never move). Alerts via HA and returns True while frozen."""
+    if stats is None:
+        return False
+
+    sig = _stats_fingerprint(stats)
+    if sig and sig == _stats_signature["sig"]:
+        _stats_signature["count"] += 1
+    else:
+        _stats_signature["sig"] = sig
+        _stats_signature["count"] = 1
+
+    frozen = _stats_signature["count"] >= STATS_FROZEN_CYCLES
+
+    if frozen:
+        if not _stats_frozen_alert_sent.get("active"):
+            mins = (_stats_signature["count"] * CHECK_INTERVAL) // 60
+            log.warning(
+                "Frigate stats frozen — identical metrics for %d cycles (~%dm)",
+                _stats_signature["count"], mins,
+            )
+            _send_system_alert(
+                title="Frigate Stats Frozen",
+                message=(
+                    f"Frigate /api/stats has returned byte-identical camera/detector "
+                    f"metrics for {_stats_signature['count']} cycles (~{mins} min) — its "
+                    f"stats engine appears wedged (cameras may still be recording). "
+                    f"A Frigate restart usually clears it."
+                ),
+            )
+            _stats_frozen_alert_sent["active"] = True
+    else:
+        if _stats_frozen_alert_sent.get("active"):
+            log.info("Frigate stats updating again")
+            _stats_frozen_alert_sent["active"] = False
+
+    return frozen
 
 
 def run_check_cycle(ip_to_cameras):
@@ -291,6 +489,17 @@ def main():
         REBOOT_THRESHOLD,
     )
     log.info("Memory alert threshold: %.0f%%", MEMORY_THRESHOLD)
+    log.info("Detector inference threshold: %.0f ms", DETECTOR_INFERENCE_THRESHOLD)
+    log.info(
+        "Stats-frozen alert: %d identical cycles (~%dm)",
+        STATS_FROZEN_CYCLES, (STATS_FROZEN_CYCLES * CHECK_INTERVAL) // 60,
+    )
+    log.info(
+        "InfluxDB: %s (org=%s, bucket=%s)",
+        INFLUXDB_URL or "disabled",
+        INFLUXDB_ORG,
+        INFLUXDB_BUCKET,
+    )
 
     while True:
         ip_to_cameras = fetch_camera_ips()
@@ -298,7 +507,11 @@ def main():
             run_check_cycle(ip_to_cameras)
         else:
             log.warning("No cameras discovered — will retry next cycle")
-        check_system_memory()
+        stats = fetch_frigate_stats()
+        check_system_memory(stats)
+        check_detectors(stats)
+        frozen = check_stats_frozen(stats)
+        collect_and_write_metrics(stats, frozen)
         time.sleep(CHECK_INTERVAL)
 
 

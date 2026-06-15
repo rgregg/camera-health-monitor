@@ -1,6 +1,6 @@
 services:
   camera-health-monitor:
-    image: ghcr.io/rgregg/camera-health-monitor:latest
+    build: .
     container_name: camera-health-monitor
     restart: unless-stopped
     environment:
@@ -11,6 +11,10 @@ services:
       - HA_URL=${HA_URL:-}
       - HA_TOKEN=${HA_TOKEN:-}
       - REBOOT_THRESHOLD=3
+      - INFLUXDB_URL=${INFLUXDB_URL:-}
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-}
+      - INFLUXDB_ORG=${INFLUXDB_ORG:-smart_home}
+      - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-frigate-health}
     # Must be able to reach Frigate API and camera IPs on 192.168.42.x
     # Option A: same network as Frigate
     # network_mode: "host"
