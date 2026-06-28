@@ -12,6 +12,13 @@ Runs as a Docker container alongside [Frigate](https://frigate.video/). Discover
 4. If still down, reboots the camera via the Reolink HTTP API
 5. Tracks reboots per camera — sends a Home Assistant notification if a camera is rebooted 3+ times in an hour (persistent failure)
 
+It also polls Frigate's `/api/stats` each cycle and raises a Home Assistant alert for several server-side failure modes (notify-only — these need a Frigate restart, not a camera reboot):
+
+- **High memory** — server memory usage above `MEMORY_THRESHOLD`
+- **Failed/hung detector** — inference time above `DETECTOR_INFERENCE_THRESHOLD` or a dead detector pid
+- **Frozen stats** — byte-identical camera/detector metrics for `STATS_FROZEN_CYCLES` cycles
+- **Wedged camera** — a camera's capture thread stuck on a dead RTSP session, burst-reading the empty restream (`camera_fps` and `skipped_fps` both ≥ `WEDGED_FPS_THRESHOLD` for `WEDGED_CYCLES` cycles) while serving a "No frames received" placeholder, even though the camera itself is healthy
+
 ## Configuration
 
 All configuration is via environment variables:
@@ -25,6 +32,11 @@ All configuration is via environment variables:
 | `HA_URL` | Home Assistant URL for notifications | (optional) |
 | `HA_TOKEN` | HA long-lived access token | (optional) |
 | `REBOOT_THRESHOLD` | Reboots in 1 hour before HA alert | `3` |
+| `MEMORY_THRESHOLD` | Server memory % before HA alert | `90` |
+| `DETECTOR_INFERENCE_THRESHOLD` | Detector inference ms before flagged hung | `1000` |
+| `STATS_FROZEN_CYCLES` | Identical-stats cycles before frozen alert | `3` |
+| `WEDGED_FPS_THRESHOLD` | `camera_fps`/`skipped_fps` indicating a wedged capture thread | `30` |
+| `WEDGED_CYCLES` | Consecutive wedged cycles before HA alert | `2` |
 
 ## Deployment
 

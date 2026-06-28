@@ -15,6 +15,10 @@ services:
       - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-}
       - INFLUXDB_ORG=${INFLUXDB_ORG:-smart_home}
       - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-frigate-health}
+      # Wedged-camera detection: alert when a capture thread burst-reads a dead
+      # restream (camera_fps/skipped_fps >= threshold for N cycles). Notify-only.
+      - WEDGED_FPS_THRESHOLD=${WEDGED_FPS_THRESHOLD:-30}
+      - WEDGED_CYCLES=${WEDGED_CYCLES:-2}
     # Must be able to reach Frigate API and camera IPs on 192.168.42.x
     # Option A: same network as Frigate
     # network_mode: "host"

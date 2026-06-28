@@ -305,6 +305,17 @@ STATS_FROZEN_CYCLES = int(os.environ.get("STATS_FROZEN_CYCLES", "3"))
 _stats_frozen_alert_sent = {"active": False}
 _stats_signature = {"sig": None, "count": 0}
 
+# A camera whose capture thread wedged on a dead RTSP session burst-reads the empty
+# restream: camera_fps AND skipped_fps both spike far above the normal ~5-7 fps while
+# Frigate serves a "No frames received" placeholder. Requiring both high avoids flagging
+# a camera that is genuinely busy but still processing frames.
+WEDGED_FPS_THRESHOLD = float(os.environ.get("WEDGED_FPS_THRESHOLD", "30"))
+# Consecutive cycles matching the burst-read signature before alerting (debounces the
+# transient fps spikes seen right after a Frigate restart).
+WEDGED_CYCLES = int(os.environ.get("WEDGED_CYCLES", "2"))
+_wedged_counts = {}       # camera -> consecutive cycles matching the signature
+_wedged_alert_sent = {}   # camera -> alert already sent for the current episode
+
 
 def _fmt_bytes(b):
     """Format bytes as human-readable string."""
@@ -428,6 +439,51 @@ def check_stats_frozen(stats):
     return frozen
 
 
+def _is_wedged(info, threshold):
+    """True if a camera's stats match the burst-read signature of a wedged capture
+    thread: both camera_fps and skipped_fps at/above threshold."""
+    return (info.get("camera_fps", 0) >= threshold
+            and info.get("skipped_fps", 0) >= threshold)
+
+
+def check_wedged_cameras(stats):
+    """Detect cameras whose capture thread wedged on a dead RTSP session and are
+    burst-reading the empty restream. Alerts once per episode (after WEDGED_CYCLES
+    consecutive cycles) and clears state on recovery. Notify-only; the fix is a
+    Frigate restart."""
+    if stats is None:
+        return
+
+    newly_wedged = []
+    for cam, info in stats.get("cameras", {}).items():
+        if _is_wedged(info, WEDGED_FPS_THRESHOLD):
+            _wedged_counts[cam] = _wedged_counts.get(cam, 0) + 1
+            if (_wedged_counts[cam] >= WEDGED_CYCLES
+                    and not _wedged_alert_sent.get(cam)):
+                newly_wedged.append(cam)
+                _wedged_alert_sent[cam] = True
+        else:
+            if _wedged_alert_sent.get(cam):
+                log.info("Camera %s recovered from wedged state", cam)
+            _wedged_counts[cam] = 0
+            _wedged_alert_sent[cam] = False
+
+    if newly_wedged:
+        names = ", ".join(sorted(newly_wedged))
+        mins = (WEDGED_CYCLES * CHECK_INTERVAL) // 60
+        log.warning("Camera(s) wedged (burst-reading): %s", names)
+        _send_system_alert(
+            title="Frigate Camera Wedged",
+            message=(
+                f"Frigate camera(s) appear wedged: {names}. Their capture thread is "
+                f"burst-reading an empty restream (camera_fps/skipped_fps >= "
+                f"{WEDGED_FPS_THRESHOLD:.0f} for ~{mins} min) and showing a 'No frames "
+                f"received' placeholder while the camera itself is healthy. "
+                f"A Frigate restart is needed to reconnect."
+            ),
+        )
+
+
 def run_check_cycle(ip_to_cameras):
     """Run one health check cycle across all cameras."""
     healthy = 0
@@ -495,6 +551,10 @@ def main():
         STATS_FROZEN_CYCLES, (STATS_FROZEN_CYCLES * CHECK_INTERVAL) // 60,
     )
     log.info(
+        "Wedged-camera alert: camera_fps/skipped_fps >= %.0f for %d cycles (~%dm)",
+        WEDGED_FPS_THRESHOLD, WEDGED_CYCLES, (WEDGED_CYCLES * CHECK_INTERVAL) // 60,
+    )
+    log.info(
         "InfluxDB: %s (org=%s, bucket=%s)",
         INFLUXDB_URL or "disabled",
         INFLUXDB_ORG,
@@ -510,6 +570,7 @@ def main():
         stats = fetch_frigate_stats()
         check_system_memory(stats)
         check_detectors(stats)
+        check_wedged_cameras(stats)
         frozen = check_stats_frozen(stats)
         collect_and_write_metrics(stats, frozen)
         time.sleep(CHECK_INTERVAL)
