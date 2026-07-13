@@ -26,6 +26,11 @@ CAMERA_PASSWORD = os.environ["CAMERA_PASSWORD"]
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "120"))
 HA_URL = os.environ.get("HA_URL", "").rstrip("/")
 HA_TOKEN = os.environ.get("HA_TOKEN", "")
+# Which HA service receives alerts. Defaults to the catch-all notify.notify; set to
+# "ticker/notify" to route through the ticker integration (then HA_NOTIFY_CATEGORY is
+# required — e.g. "Frigate" at home, "Cabin" at the cabin).
+HA_NOTIFY_SERVICE = os.environ.get("HA_NOTIFY_SERVICE", "notify/notify").strip("/")
+HA_NOTIFY_CATEGORY = os.environ.get("HA_NOTIFY_CATEGORY", "").strip()
 REBOOT_THRESHOLD = int(os.environ.get("REBOOT_THRESHOLD", "3"))
 RTSP_PORT = 554
 RTSP_TIMEOUT = 3  # seconds
@@ -35,6 +40,18 @@ INFLUXDB_URL = os.environ.get("INFLUXDB_URL", "").rstrip("/")
 INFLUXDB_TOKEN = os.environ.get("INFLUXDB_TOKEN", "")
 INFLUXDB_ORG = os.environ.get("INFLUXDB_ORG", "smart_home")
 INFLUXDB_BUCKET = os.environ.get("INFLUXDB_BUCKET", "frigate-health")
+
+# Auto-restart Frigate when its stats/recording engine wedges (stats freeze and
+# recordings silently stop while the container stays "up"). Uses Frigate's own
+# /api/restart, so the monitor needs no host/docker access. Guarded by a cooldown and a
+# rolling 24h cap so a persistent problem can't turn into a restart loop.
+AUTO_RESTART_FROZEN = os.environ.get("AUTO_RESTART_FROZEN", "true").lower() in (
+    "1", "true", "yes", "on",
+)
+RESTART_COOLDOWN = int(os.environ.get("RESTART_COOLDOWN", "900"))  # min seconds between restarts
+MAX_RESTARTS_PER_DAY = int(os.environ.get("MAX_RESTARTS_PER_DAY", "4"))
+_restart_history = []      # timestamps of auto-restarts within the last 24h
+_last_restart_time = 0.0
 
 
 def fetch_camera_ips():
@@ -152,21 +169,7 @@ def send_ha_notification(ip, camera_names):
         f"Camera {names} ({ip}) has been rebooted {count} times in the last hour. "
         f"This may indicate a hardware or firmware problem that needs manual attention."
     )
-    payload = json.dumps({
-        "message": message,
-        "title": f"Camera Health Alert: {names}",
-    }).encode()
-
-    url = f"{HA_URL}/api/services/notify/notify"
-    req = Request(url, data=payload, method="POST")
-    req.add_header("Authorization", f"Bearer {HA_TOKEN}")
-    req.add_header("Content-Type", "application/json")
-
-    try:
-        with urlopen(req, timeout=10) as resp:
-            log.info("HA notification sent for %s (%s)", names, ip)
-    except (URLError, OSError) as e:
-        log.warning("Failed to send HA notification: %s", e)
+    _send_system_alert(title=f"Camera Health Alert: {names}", message=message)
 
 
 def fetch_frigate_stats():
@@ -327,21 +330,92 @@ def _fmt_bytes(b):
 
 
 def _send_system_alert(title, message):
-    """Send a system-level alert to Home Assistant."""
+    """Send an alert to Home Assistant via the configured notify service.
+
+    Routes through HA_NOTIFY_SERVICE (default notify.notify). When targeting the ticker
+    integration, HA_NOTIFY_CATEGORY is included as the required `category` field. The
+    payload is kept flat — the ticker service itself wraps `data` for the underlying
+    notifier, so double-wrapping here would break it."""
     if not HA_URL or not HA_TOKEN:
         return
 
-    payload = json.dumps({"message": message, "title": title}).encode()
-    url = f"{HA_URL}/api/services/notify/notify"
+    body = {"title": title, "message": message}
+    if HA_NOTIFY_CATEGORY:
+        body["category"] = HA_NOTIFY_CATEGORY
+    payload = json.dumps(body).encode()
+    url = f"{HA_URL}/api/services/{HA_NOTIFY_SERVICE}"
     req = Request(url, data=payload, method="POST")
     req.add_header("Authorization", f"Bearer {HA_TOKEN}")
     req.add_header("Content-Type", "application/json")
 
     try:
         with urlopen(req, timeout=10) as resp:
-            log.info("HA system alert sent: %s", title)
+            log.info("HA alert sent via %s: %s", HA_NOTIFY_SERVICE, title)
     except (URLError, OSError) as e:
-        log.warning("Failed to send HA system alert: %s", e)
+        log.warning("Failed to send HA alert via %s: %s", HA_NOTIFY_SERVICE, e)
+
+
+def _can_auto_restart(now):
+    """Return (allowed, reason_if_blocked) for issuing an auto-restart at time `now`."""
+    if not AUTO_RESTART_FROZEN:
+        return False, "auto-restart disabled"
+    since = now - _last_restart_time
+    if since < RESTART_COOLDOWN:
+        return False, f"in cooldown ({int(RESTART_COOLDOWN - since)}s left)"
+    recent = [t for t in _restart_history if t > now - 86400]
+    if len(recent) >= MAX_RESTARTS_PER_DAY:
+        return False, f"daily cap reached ({MAX_RESTARTS_PER_DAY}/24h)"
+    return True, ""
+
+
+def _record_restart(now):
+    """Record an auto-restart at `now` and prune history older than 24h."""
+    global _last_restart_time
+    _last_restart_time = now
+    _restart_history.append(now)
+    _restart_history[:] = [t for t in _restart_history if t > now - 86400]
+
+
+def restart_frigate(reason):
+    """Ask Frigate to restart itself via /api/restart to clear a software wedge. This
+    restarts the Frigate app (detectors, capture, recording) without touching the
+    container, so no host/docker access is needed. Returns True if accepted."""
+    url = f"{FRIGATE_URL}/api/restart"
+    req = Request(url, data=b"", method="POST")
+    try:
+        with urlopen(req, timeout=15) as resp:
+            ok = 200 <= resp.status < 300
+    except (URLError, OSError) as e:
+        log.error("Frigate /api/restart failed (%s): %s", reason, e)
+        return False
+    log.warning("Requested Frigate restart (%s)", reason)
+    return ok
+
+
+def maybe_auto_restart(reason, now=None):
+    """Auto-restart Frigate for `reason`, honoring the enable flag, cooldown and daily
+    cap. Alerts either way and returns True if a restart was issued."""
+    now = time.time() if now is None else now
+    allowed, why = _can_auto_restart(now)
+    if not allowed:
+        log.info("Not auto-restarting Frigate (%s): %s", reason, why)
+        return False
+
+    _record_restart(now)
+    ok = restart_frigate(reason)
+    count = len([t for t in _restart_history if t > now - 86400])
+    _send_system_alert(
+        title="Frigate Auto-Restart",
+        message=(
+            f"camera-health-monitor {'restarted' if ok else 'tried to restart'} Frigate "
+            f"automatically: {reason}. Restart {count}/{MAX_RESTARTS_PER_DAY} in the last "
+            f"24h. If this keeps happening, Frigate needs manual attention."
+        ),
+    )
+    # Require a fresh run of frozen cycles before another restart can trigger.
+    _stats_signature["sig"] = None
+    _stats_signature["count"] = 0
+    return ok
 
 
 def check_detectors(stats):
@@ -540,9 +614,16 @@ def main():
     log.info("Check interval: %ds", CHECK_INTERVAL)
     log.info("Reboot cooldown: %ds", REBOOT_COOLDOWN)
     log.info(
-        "HA notifications: %s (threshold: %d reboots/hour)",
+        "HA notifications: %s via %s%s (threshold: %d reboots/hour)",
         "enabled" if HA_URL else "disabled",
+        HA_NOTIFY_SERVICE,
+        f" [category={HA_NOTIFY_CATEGORY}]" if HA_NOTIFY_CATEGORY else "",
         REBOOT_THRESHOLD,
+    )
+    log.info(
+        "Auto-restart on stats-frozen: %s (cooldown %ds, cap %d/24h)",
+        "enabled" if AUTO_RESTART_FROZEN else "disabled",
+        RESTART_COOLDOWN, MAX_RESTARTS_PER_DAY,
     )
     log.info("Memory alert threshold: %.0f%%", MEMORY_THRESHOLD)
     log.info("Detector inference threshold: %.0f ms", DETECTOR_INFERENCE_THRESHOLD)
@@ -572,6 +653,8 @@ def main():
         check_detectors(stats)
         check_wedged_cameras(stats)
         frozen = check_stats_frozen(stats)
+        if frozen:
+            maybe_auto_restart("Frigate stats frozen (recording/stats engine wedged)")
         collect_and_write_metrics(stats, frozen)
         time.sleep(CHECK_INTERVAL)
 

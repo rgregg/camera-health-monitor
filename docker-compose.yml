@@ -10,7 +10,16 @@ services:
       - CHECK_INTERVAL=120
       - HA_URL=${HA_URL:-}
       - HA_TOKEN=${HA_TOKEN:-}
+      # Route alerts through a specific HA service. Default notify/notify; set to
+      # ticker/notify + a category to use the ticker (Frigate at home, Cabin at the cabin).
+      - HA_NOTIFY_SERVICE=${HA_NOTIFY_SERVICE:-notify/notify}
+      - HA_NOTIFY_CATEGORY=${HA_NOTIFY_CATEGORY:-}
       - REBOOT_THRESHOLD=3
+      # Auto-restart Frigate (via its /api/restart) when the stats/recording engine wedges.
+      # Guarded by a cooldown and a rolling 24h cap so it can't loop.
+      - AUTO_RESTART_FROZEN=${AUTO_RESTART_FROZEN:-true}
+      - RESTART_COOLDOWN=${RESTART_COOLDOWN:-900}
+      - MAX_RESTARTS_PER_DAY=${MAX_RESTARTS_PER_DAY:-4}
       - INFLUXDB_URL=${INFLUXDB_URL:-}
       - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-}
       - INFLUXDB_ORG=${INFLUXDB_ORG:-smart_home}
