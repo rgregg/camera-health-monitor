@@ -85,6 +85,32 @@ def fetch_camera_ips():
     return ip_to_cameras
 
 
+def fetch_camera_settings():
+    """Fetch Frigate config and return (expected_fps, recording_cameras):
+
+      expected_fps      {camera: configured detect fps} for ratio-based wedge detection
+      recording_cameras [camera] for those enabled AND with recording on — the only
+                        cameras for which a recording gap is meaningful
+    """
+    url = f"{FRIGATE_URL}/api/config"
+    try:
+        with urlopen(url, timeout=10) as resp:
+            config = json.loads(resp.read())
+    except (URLError, OSError, json.JSONDecodeError) as e:
+        log.error("Failed to fetch Frigate config from %s: %s", url, e)
+        return {}, []
+
+    expected_fps = {}
+    recording_cameras = []
+    for name, cam in config.get("cameras", {}).items():
+        fps = cam.get("detect", {}).get("fps")
+        if fps:
+            expected_fps[name] = fps
+        if cam.get("enabled", True) and cam.get("record", {}).get("enabled"):
+            recording_cameras.append(name)
+    return expected_fps, recording_cameras
+
+
 def check_rtsp(ip):
     """Return True if RTSP port 554 is accepting connections."""
     try:
@@ -303,21 +329,44 @@ _detector_alert_sent = {"active": False}
 # Inference time above this (in ms) indicates a hung/failed detector
 DETECTOR_INFERENCE_THRESHOLD = float(os.environ.get("DETECTOR_INFERENCE_THRESHOLD", "1000"))
 
-# Consecutive cycles of byte-identical Frigate stats before flagging the stats engine frozen
+# Consecutive cycles of byte-identical Frigate stats before flagging the stats engine
+# frozen. Deliberately GLOBAL (all cameras + detectors in one fingerprint), not
+# per-camera: measured against the live server, healthy cameras produce only 1-3 distinct
+# fingerprints (camera_fps/process_fps are rolling averages rounded to one decimal;
+# detection_fps/skipped_fps sit at 0.0 when idle), and two of thirteen repeated a single
+# value for 12 consecutive polls. Per-camera fingerprinting flagged 11-12 of 13 healthy
+# cameras as frozen — a stable camera is indistinguishable from a stuck one this way.
+# Detecting ONE hung camera is check_recording_gaps()'s job instead, which measures
+# whether segments are actually being written rather than guessing from stats.
 STATS_FROZEN_CYCLES = int(os.environ.get("STATS_FROZEN_CYCLES", "3"))
 _stats_frozen_alert_sent = {"active": False}
 _stats_signature = {"sig": None, "count": 0}
 
-# A camera whose capture thread wedged on a dead RTSP session burst-reads the empty
-# restream: camera_fps AND skipped_fps both spike far above the normal ~5-7 fps while
-# Frigate serves a "No frames received" placeholder. Requiring both high avoids flagging
-# a camera that is genuinely busy but still processing frames.
+# A camera whose capture thread wedges burst-reads its restream far above the configured
+# rate. Two variants seen in the wild:
+#   - empty restream: camera_fps AND skipped_fps both spike (Frigate serves "No frames
+#     received" and skips nearly everything)
+#   - live restream: camera_fps spikes but frames are still processed, so skipped_fps
+#     stays near zero (home front_door 2026-08-15: 104 fps read, only 3.8 skipped)
+# Either alone is abnormal, so the absolute thresholds are OR'd. When the camera's
+# configured detect fps is known, WEDGED_FPS_RATIO catches runaways well below the
+# absolute floor (e.g. 20 fps on a 5 fps camera).
 WEDGED_FPS_THRESHOLD = float(os.environ.get("WEDGED_FPS_THRESHOLD", "30"))
+WEDGED_FPS_RATIO = float(os.environ.get("WEDGED_FPS_RATIO", "3"))
 # Consecutive cycles matching the burst-read signature before alerting (debounces the
 # transient fps spikes seen right after a Frigate restart).
 WEDGED_CYCLES = int(os.environ.get("WEDGED_CYCLES", "2"))
 _wedged_counts = {}       # camera -> consecutive cycles matching the signature
 _wedged_alert_sent = {}   # camera -> alert already sent for the current episode
+
+# A camera that has written no recording segment for this long is broken regardless of
+# what its fps or stats signature look like. Frigate writes ~10s segments, so a healthy
+# camera's newest segment is always seconds old. This is the direct backstop for any
+# wedge that slips past the fps/frozen heuristics above.
+RECORDING_GAP_SECONDS = int(os.environ.get("RECORDING_GAP_SECONDS", "900"))
+RECORDING_GAP_CYCLES = int(os.environ.get("RECORDING_GAP_CYCLES", "2"))
+_recording_gap_counts = {}       # camera -> consecutive cycles with a stale newest segment
+_recording_gap_alert_sent = {}   # camera -> alert already sent for the current episode
 
 
 def _fmt_bytes(b):
@@ -412,9 +461,11 @@ def maybe_auto_restart(reason, now=None):
             f"24h. If this keeps happening, Frigate needs manual attention."
         ),
     )
-    # Require a fresh run of frozen cycles before another restart can trigger.
+    # Require a fresh run of frozen/stale cycles before another restart can trigger.
     _stats_signature["sig"] = None
     _stats_signature["count"] = 0
+    _recording_gap_counts.clear()
+    _recording_gap_alert_sent.clear()
     return ok
 
 
@@ -459,7 +510,12 @@ def check_detectors(stats):
 def _stats_fingerprint(stats):
     """Signature of the volatile per-camera/detector metrics that SHOULD change every
     cycle. Excludes uptime/memory (always advance) so an identical signature means
-    Frigate's stats are genuinely stuck, not just stable."""
+    Frigate's stats are genuinely stuck, not just stable.
+
+    Combining every camera is what keeps this check honest: an individual camera's
+    fingerprint has too little entropy to be meaningful on its own (see the note on
+    STATS_FROZEN_CYCLES), but ALL of them freezing simultaneously is a real engine
+    wedge, since any single camera still reporting resets the counter."""
     parts = []
     for cam in sorted(stats.get("cameras", {})):
         info = stats["cameras"][cam]
@@ -475,7 +531,9 @@ def _stats_fingerprint(stats):
 def check_stats_frozen(stats):
     """Detect a wedged Frigate stats engine: byte-identical camera/detector metrics
     across STATS_FROZEN_CYCLES consecutive cycles (uptime keeps advancing, but the
-    real metrics never move). Alerts via HA and returns True while frozen."""
+    real metrics never move). Alerts via HA and returns True while frozen.
+
+    This cannot see a SINGLE hung camera — check_recording_gaps() covers that."""
     if stats is None:
         return False
 
@@ -513,24 +571,37 @@ def check_stats_frozen(stats):
     return frozen
 
 
-def _is_wedged(info, threshold):
+def _is_wedged(info, threshold, expected_fps=None, ratio=None):
     """True if a camera's stats match the burst-read signature of a wedged capture
-    thread: both camera_fps and skipped_fps at/above threshold."""
-    return (info.get("camera_fps", 0) >= threshold
-            and info.get("skipped_fps", 0) >= threshold)
+    thread.
+
+    Either metric alone is enough: a wedge on an empty restream spikes camera_fps AND
+    skipped_fps together, but a wedge on a still-live restream spikes camera_fps while
+    frames continue to be processed (skipped_fps near zero). Requiring both — the
+    original condition — missed the second variant entirely.
+
+    When `expected_fps` (the camera's configured detect fps) is known, a rate more than
+    `ratio`x that is flagged too, which catches runaways below the absolute threshold."""
+    camera_fps = info.get("camera_fps", 0)
+    if expected_fps and camera_fps >= expected_fps * (ratio or WEDGED_FPS_RATIO):
+        return True
+    return camera_fps >= threshold or info.get("skipped_fps", 0) >= threshold
 
 
-def check_wedged_cameras(stats):
-    """Detect cameras whose capture thread wedged on a dead RTSP session and are
-    burst-reading the empty restream. Alerts once per episode (after WEDGED_CYCLES
-    consecutive cycles) and clears state on recovery. Notify-only; the fix is a
-    Frigate restart."""
+def check_wedged_cameras(stats, expected_fps=None):
+    """Detect cameras whose capture thread wedged and are burst-reading their restream.
+    Alerts once per episode (after WEDGED_CYCLES consecutive cycles) and clears state on
+    recovery. Notify-only; the fix is a Frigate restart.
+
+    `expected_fps` maps camera name -> configured detect fps, enabling ratio-based
+    detection for runaways below the absolute threshold."""
     if stats is None:
         return
 
+    expected_fps = expected_fps or {}
     newly_wedged = []
     for cam, info in stats.get("cameras", {}).items():
-        if _is_wedged(info, WEDGED_FPS_THRESHOLD):
+        if _is_wedged(info, WEDGED_FPS_THRESHOLD, expected_fps.get(cam)):
             _wedged_counts[cam] = _wedged_counts.get(cam, 0) + 1
             if (_wedged_counts[cam] >= WEDGED_CYCLES
                     and not _wedged_alert_sent.get(cam)):
@@ -550,12 +621,82 @@ def check_wedged_cameras(stats):
             title="Frigate Camera Wedged",
             message=(
                 f"Frigate camera(s) appear wedged: {names}. Their capture thread is "
-                f"burst-reading an empty restream (camera_fps/skipped_fps >= "
-                f"{WEDGED_FPS_THRESHOLD:.0f} for ~{mins} min) and showing a 'No frames "
-                f"received' placeholder while the camera itself is healthy. "
-                f"A Frigate restart is needed to reconnect."
+                f"burst-reading the restream far above the configured rate for "
+                f"~{mins} min, so they are likely not recording, while the cameras "
+                f"themselves are healthy. A Frigate restart is needed to reconnect."
             ),
         )
+
+
+def _recording_age(segments, now):
+    """Seconds since the newest recording segment ended, or None if there are none."""
+    if not segments:
+        return None
+    return now - max(s.get("end_time", 0) for s in segments)
+
+
+def fetch_recording_ages(cameras, now=None):
+    """Return {camera: seconds_since_newest_segment_or_None} by asking Frigate for each
+    camera's recent recording segments. A camera with no segments in the window maps to
+    None, which check_recording_gaps treats as a gap."""
+    now = time.time() if now is None else now
+    window = max(RECORDING_GAP_SECONDS * 2, 3600)
+    ages = {}
+    for cam in cameras:
+        url = (f"{FRIGATE_URL}/api/{quote(cam)}/recordings"
+               f"?after={int(now - window)}&before={int(now)}")
+        try:
+            with urlopen(url, timeout=10) as resp:
+                segments = json.loads(resp.read())
+        except (URLError, OSError, json.JSONDecodeError) as e:
+            # Don't manufacture a gap out of a failed query — skip this camera.
+            log.warning("Failed to fetch recordings for %s: %s", cam, e)
+            continue
+        ages[cam] = _recording_age(segments, now)
+    return ages
+
+
+def check_recording_gaps(ages):
+    """Detect cameras that have written no recording segment recently. Whatever the fps
+    or stats signature look like, this is the ground truth: Frigate writes ~10s
+    segments, so a healthy camera's newest segment is always seconds old.
+
+    Alerts once per episode after RECORDING_GAP_CYCLES consecutive stale cycles and
+    returns the sorted list of currently-stale cameras."""
+    stale = []
+    newly_stale = []
+    for cam, age in ages.items():
+        if age is None or age >= RECORDING_GAP_SECONDS:
+            _recording_gap_counts[cam] = _recording_gap_counts.get(cam, 0) + 1
+            if _recording_gap_counts[cam] >= RECORDING_GAP_CYCLES:
+                stale.append(cam)
+                if not _recording_gap_alert_sent.get(cam):
+                    newly_stale.append(cam)
+                    _recording_gap_alert_sent[cam] = True
+        else:
+            if _recording_gap_alert_sent.get(cam):
+                log.info("Camera %s is recording again", cam)
+            _recording_gap_counts[cam] = 0
+            _recording_gap_alert_sent[cam] = False
+
+    if newly_stale:
+        names = ", ".join(sorted(newly_stale))
+        detail = ", ".join(
+            f"{c}={'no segments' if ages[c] is None else f'{ages[c] / 60:.0f}m ago'}"
+            for c in sorted(newly_stale)
+        )
+        log.warning("Camera(s) not recording: %s", detail)
+        _send_system_alert(
+            title="Frigate Camera Not Recording",
+            message=(
+                f"Frigate camera(s) have written no recording segments for over "
+                f"{RECORDING_GAP_SECONDS // 60} min: {detail}. The cameras may still "
+                f"look online and their stats may look plausible — check {names} and "
+                f"restart Frigate if needed."
+            ),
+        )
+
+    return sorted(stale)
 
 
 def run_check_cycle(ip_to_cameras):
@@ -598,7 +739,10 @@ def run_check_cycle(ip_to_cameras):
             failed += 1
 
     total = len(ip_to_cameras)
-    parts = [f"{healthy}/{total} healthy"]
+    # Deliberately specific: this counts RTSP port reachability on the camera IPs, NOT
+    # whether Frigate is ingesting or recording them. Labelling it "healthy" made a
+    # green line look like a verdict on the NVR while a camera sat wedged for hours.
+    parts = [f"{healthy}/{total} camera IPs reachable"]
     if rebooted:
         parts.append(f"{rebooted} rebooted")
     if cooldown:
@@ -628,12 +772,18 @@ def main():
     log.info("Memory alert threshold: %.0f%%", MEMORY_THRESHOLD)
     log.info("Detector inference threshold: %.0f ms", DETECTOR_INFERENCE_THRESHOLD)
     log.info(
-        "Stats-frozen alert: %d identical cycles (~%dm)",
+        "Stats-frozen alert: %d identical cycles per camera (~%dm)",
         STATS_FROZEN_CYCLES, (STATS_FROZEN_CYCLES * CHECK_INTERVAL) // 60,
     )
     log.info(
-        "Wedged-camera alert: camera_fps/skipped_fps >= %.0f for %d cycles (~%dm)",
-        WEDGED_FPS_THRESHOLD, WEDGED_CYCLES, (WEDGED_CYCLES * CHECK_INTERVAL) // 60,
+        "Wedged-camera alert: camera_fps or skipped_fps >= %.0f (or >= %.1fx configured "
+        "fps) for %d cycles (~%dm)",
+        WEDGED_FPS_THRESHOLD, WEDGED_FPS_RATIO, WEDGED_CYCLES,
+        (WEDGED_CYCLES * CHECK_INTERVAL) // 60,
+    )
+    log.info(
+        "Recording-gap alert: no segments for %dm across %d cycles",
+        RECORDING_GAP_SECONDS // 60, RECORDING_GAP_CYCLES,
     )
     log.info(
         "InfluxDB: %s (org=%s, bucket=%s)",
@@ -648,13 +798,20 @@ def main():
             run_check_cycle(ip_to_cameras)
         else:
             log.warning("No cameras discovered — will retry next cycle")
+        expected_fps, recording_cameras = fetch_camera_settings()
         stats = fetch_frigate_stats()
         check_system_memory(stats)
         check_detectors(stats)
-        check_wedged_cameras(stats)
+        check_wedged_cameras(stats, expected_fps)
         frozen = check_stats_frozen(stats)
+        stale = check_recording_gaps(fetch_recording_ages(recording_cameras))
+
         if frozen:
             maybe_auto_restart("Frigate stats frozen (recording/stats engine wedged)")
+        elif stale:
+            maybe_auto_restart(
+                f"no recordings from {', '.join(stale)} for over "
+                f"{RECORDING_GAP_SECONDS // 60}m")
         collect_and_write_metrics(stats, frozen)
         time.sleep(CHECK_INTERVAL)
 

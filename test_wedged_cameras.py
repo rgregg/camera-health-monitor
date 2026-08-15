@@ -31,9 +31,38 @@ def test_is_wedged_false_for_healthy_camera():
     assert monitor._is_wedged(_cam(7.0, 0.1), threshold=30) is False
 
 
-def test_is_wedged_false_when_high_fps_but_not_skipping():
-    # A genuinely busy camera processing frames is not wedged.
-    assert monitor._is_wedged(_cam(40.0, 0.0), threshold=30) is False
+def test_is_wedged_true_when_high_fps_without_skipping():
+    # Regression, home front_door 2026-08-15: the capture thread wedged while the
+    # restream was still delivering real frames, so Frigate burst-read at 104 fps and
+    # processed nearly all of them (skipped_fps only 3.8). The original `and skipped_fps`
+    # condition missed it and the camera recorded nothing for ~11h.
+    assert monitor._is_wedged(_cam(104.0, 3.8), threshold=30) is True
+
+
+def test_is_wedged_true_when_only_skipping_high():
+    # The empty-restream variant: skipping spikes even if camera_fps is read differently.
+    assert monitor._is_wedged(_cam(10.0, 95.0), threshold=30) is True
+
+
+# --- expected-fps aware detection (catches runaway below the absolute threshold) ---
+
+
+def test_is_wedged_true_when_fps_far_above_configured_rate():
+    # 20 fps on a camera configured for 5 is a runaway, even though 20 < threshold 30.
+    assert monitor._is_wedged(_cam(20.0, 0.0), threshold=30,
+                              expected_fps=5, ratio=3.0) is True
+
+
+def test_is_wedged_false_for_normal_jitter_above_configured_rate():
+    # Healthy cameras sit slightly above their configured fps (5.0-5.2) — not a wedge.
+    assert monitor._is_wedged(_cam(5.2, 0.0), threshold=30,
+                              expected_fps=5, ratio=3.0) is False
+
+
+def test_is_wedged_false_just_under_ratio():
+    # 14.9 fps against 5 * 3.0 = 15.0 stays below the bar.
+    assert monitor._is_wedged(_cam(14.9, 0.0), threshold=30,
+                              expected_fps=5, ratio=3.0) is False
 
 
 # --- check_wedged_cameras state machine ---
