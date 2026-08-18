@@ -772,7 +772,8 @@ def main():
     log.info("Memory alert threshold: %.0f%%", MEMORY_THRESHOLD)
     log.info("Detector inference threshold: %.0f ms", DETECTOR_INFERENCE_THRESHOLD)
     log.info(
-        "Stats-frozen alert: %d identical cycles per camera (~%dm)",
+        "Stats-frozen alert: %d identical all-camera cycles (~%dm); single hung cameras "
+        "are caught by the recording-gap check, not this one",
         STATS_FROZEN_CYCLES, (STATS_FROZEN_CYCLES * CHECK_INTERVAL) // 60,
     )
     log.info(
